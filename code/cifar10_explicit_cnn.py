@@ -178,6 +178,7 @@ def visualize_first_conv_feature_maps(
         print(f"saved feature-map figure to {save_path}")
     else:
         plt.show()
+    input("Continue")
     plt.close(fig)
 
 
