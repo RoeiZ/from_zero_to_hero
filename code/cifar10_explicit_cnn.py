@@ -18,9 +18,6 @@ import argparse
 
 import torch
 import torch.nn as nn
-import matplotlib
-
-matplotlib.use("Agg")  # headless-safe backend; Colab/notebook cells override this
 import matplotlib.pyplot as plt
 
 
@@ -184,6 +181,59 @@ def visualize_first_conv_feature_maps(
     plt.close(fig)
 
 
+def visualize_predictions(
+    model: ExplicitCIFAR10CNN,
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    class_names: tuple = CIFAR10_CLASSES,
+    num_examples: int = 5,
+    save_path: str | None = None,
+):
+    """Qualitative check: show `num_examples` images next to their
+    ground-truth label and the model's predicted label (green title if
+    correct, red if wrong).
+
+    images: [N, 3, 32, 32] float in [0,1] (ToTensor output), already on
+    the same device as `model`. labels: [N] int64 ground-truth class
+    indices, any device.
+    """
+    num_examples = min(num_examples, images.size(0))
+
+    model.eval()
+    with torch.no_grad():
+        logits = model(images[:num_examples])  # [num_examples, 10]
+    predicted = logits.argmax(dim=1).cpu()  # [num_examples]
+    images_cpu = images[:num_examples].cpu()  # [num_examples, 3, 32, 32]
+    labels_cpu = labels[:num_examples].cpu()  # [num_examples]
+
+    fig, axes = plt.subplots(1, num_examples, figsize=(2.6 * num_examples, 3.0))
+    if num_examples == 1:
+        axes = [axes]
+
+    for i in range(num_examples):
+        image_hwc = images_cpu[i].permute(1, 2, 0).numpy()  # [3,32,32] -> [32,32,3] for imshow
+        axes[i].imshow(image_hwc)
+        true_name = class_names[labels_cpu[i].item()]
+        pred_name = class_names[predicted[i].item()]
+        is_correct = predicted[i].item() == labels_cpu[i].item()
+        axes[i].set_title(
+            f"true: {true_name}\npred: {pred_name}",
+            color=("green" if is_correct else "red"),
+            fontsize=9,
+        )
+        axes[i].axis("off")
+
+    fig.suptitle(f"sample predictions ({num_examples} test examples)")
+    fig.tight_layout()
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=120)
+        print(f"saved predictions figure to {save_path}")
+    else:
+        plt.show()
+    plt.close(fig)
+
+
 def train_one_epoch(model, loader, loss_fn, optimizer, device):
     model.train()
     total_loss, total_correct, total_samples = 0.0, 0, 0
@@ -254,6 +304,11 @@ def run_smoke_test(device: torch.device):
         model, dummy_images[0], num_maps=10, save_path=scratch_png,
     )
 
+    scratch_predictions_png = "cifar10_explicit_cnn_smoke_predictions.png"
+    visualize_predictions(
+        model, dummy_images, dummy_labels, num_examples=4, save_path=scratch_predictions_png,
+    )
+
     print("\nsmoke test passed.")
 
 
@@ -294,10 +349,15 @@ def main():
             f"test_loss={test_loss:.4f} test_acc={test_acc:.4f}"
         )
 
-    sample_image, _ = next(iter(test_loader))
+    sample_images, sample_labels = next(iter(test_loader))
+    sample_images = sample_images.to(device)
     visualize_first_conv_feature_maps(
-        model, sample_image[0].to(device), num_maps=10,
+        model, sample_images[0], num_maps=10,
         save_path="cifar10_conv1_feature_maps.png",
+    )
+    visualize_predictions(
+        model, sample_images, sample_labels, num_examples=5,
+        save_path="cifar10_sample_predictions.png",
     )
 
 

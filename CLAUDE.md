@@ -99,6 +99,30 @@ large datasets - benchmarks - thesis experiments - checkpoint
 generation - runtime/GPU-memory measurement - expensive spectral
 analysis
 
+### Dataset Caching (download once, not every run)
+
+Colab's local disk (`/content/...`) is ephemeral and wiped whenever the
+runtime recycles or disconnects, so a dataset downloaded there is
+re-downloaded on every fresh session. Instead, mount Google Drive and
+point the dataset's root/download directory at a persistent Drive path
+(configurable, not hard-coded). Dataset loaders should check whether the
+data already exists at that path and only download if missing.
+
+``` python
+from google.colab import drive
+drive.mount('/content/drive')
+
+dataset_root = '/content/drive/MyDrive/thesis_data/cifar10'
+train_set = torchvision.datasets.CIFAR10(
+    root=dataset_root, train=True, download=True, transform=transform
+)
+```
+
+Tradeoff: reading many small files directly from Drive can be slower
+than local disk. For small datasets (e.g. CIFAR-10) this is negligible;
+for larger datasets, prefer copying from Drive to local `/content` once
+at the start of each run, then reading locally for speed.
+
 All training/experiment code must work in a fresh Colab runtime. Never
 assume the local PC has CUDA.
 
@@ -210,6 +234,28 @@ or paper/official-code comparison.
 
 After changes summarize: - files changed - conceptual change - checks
 run - checks not run - what must be tested in Colab
+
+## Results Visualization
+
+Every exercise/project must include a qualitative results-visualization
+step, not only scalar metrics. After evaluation, show a small number of
+concrete examples (around 5) with: input, ground-truth label/target,
+and model output/prediction, displayed together (e.g. image grid with
+titles showing true vs. predicted, or input/reconstruction/target
+side-by-side for reconstruction and diffusion tasks).
+
+Prefer visualizing as much as is informative for the task, for example:
+- sample predictions vs. ground truth (classification)
+- input / reconstruction / target triplets (autoencoders, inverse
+  problems)
+- noising/denoising steps or generated samples (DDPM/DDIM)
+- loss curves and any other relevant training curves
+- attention maps or spectral plots when relevant to the method
+
+Keep visualization code in the `.py` script/module (e.g. a
+`visualize_predictions`-style function), with the Colab notebook simply
+calling it and displaying the output, consistent with the
+"notebooks are thin orchestration layers" philosophy.
 
 ## Claude Execution Policy
 
