@@ -59,6 +59,116 @@ from stl10_unet import (
 )
 
 
+def unet_encode(unet: SmallUNet, x: torch.Tensor) -> dict:
+    """Runs only SmallUNet's encoder path, by calling its named layers
+    directly in the same order as SmallUNet.forward (see
+    code/stl10_unet.py) -- no change to that class, just a second entry
+    point that stops before the decoder so the three skip tensors and
+    the bottleneck feature map can be inspected/swapped independently.
+
+    x: [B,3,96,96] -> dict with skip0 [B,32,96,96], skip1 [B,64,48,48],
+    skip2 [B,128,24,24], bottleneck [B,256,12,12]."""
+    h = unet.enc0_relu(unet.enc0_conv(x))
+    skip0 = h
+    h = unet.down0_relu(unet.down0(h))
+
+    h = unet.enc1_relu(unet.enc1_conv(h))
+    skip1 = h
+    h = unet.down1_relu(unet.down1(h))
+
+    h = unet.enc2_relu(unet.enc2_conv(h))
+    skip2 = h
+    h = unet.down2_relu(unet.down2(h))
+
+    bottleneck = unet.bottleneck_relu(unet.bottleneck_conv(h))
+
+    return {"skip0": skip0, "skip1": skip1, "skip2": skip2, "bottleneck": bottleneck}
+
+
+def unet_decode(unet: SmallUNet, encoded: dict, zero_skips: tuple = ()) -> torch.Tensor:
+    """Runs only SmallUNet's decoder path given an `encoded` dict from
+    `unet_encode` (same bottleneck/skip0/skip1/skip2 keys), optionally
+    replacing named skip tensors with zeros before their `torch.cat`
+    -- the skip-ablation test: if the reconstruction barely degrades
+    with `zero_skips=("skip0","skip1","skip2")`, the bottleneck alone
+    already explains most of the output; if it degrades sharply, the
+    skip connections were carrying most of the reconstructed detail.
+
+    zero_skips: subset of {"skip0","skip1","skip2"} to zero out."""
+    skip0, skip1, skip2 = encoded["skip0"], encoded["skip1"], encoded["skip2"]
+    if "skip0" in zero_skips:
+        skip0 = torch.zeros_like(skip0)
+    if "skip1" in zero_skips:
+        skip1 = torch.zeros_like(skip1)
+    if "skip2" in zero_skips:
+        skip2 = torch.zeros_like(skip2)
+
+    h = unet.up2_relu(unet.up2(encoded["bottleneck"]))
+    h = torch.cat([h, skip2], dim=1)  # [B,128,24,24]+[B,128,24,24] -> [B,256,24,24]
+    h = unet.dec2_relu(unet.dec2_conv(h))
+
+    h = unet.up1_relu(unet.up1(h))
+    h = torch.cat([h, skip1], dim=1)  # [B,64,48,48]+[B,64,48,48] -> [B,128,48,48]
+    h = unet.dec1_relu(unet.dec1_conv(h))
+
+    h = unet.up0_relu(unet.up0(h))
+    h = torch.cat([h, skip0], dim=1)  # [B,32,96,96]+[B,32,96,96] -> [B,64,96,96]
+    h = unet.dec0_relu(unet.dec0_conv(h))
+
+    h = unet.out_conv(h)
+    return unet.sigmoid(h)
+
+
+@torch.no_grad()
+def skip_ablation_reconstruction(unet: SmallUNet, images: torch.Tensor) -> torch.Tensor:
+    """Skip-ablation test: decode with all three skip tensors zeroed,
+    i.e. reconstruct from the [B,256,12,12] bottleneck alone. Compares
+    against the normal reconstruction to show how much detail the skip
+    connections were responsible for (see module docstring)."""
+    unet.eval()
+    encoded = unet_encode(unet, images)
+    return unet_decode(unet, encoded, zero_skips=("skip0", "skip1", "skip2"))
+
+
+@torch.no_grad()
+def skip_swap_reconstruction(unet: SmallUNet, images_a: torch.Tensor, images_b: torch.Tensor) -> torch.Tensor:
+    """Skip-swap test: decode image A's bottleneck using image B's skip
+    tensors. If the result looks like B rather than A, the skip
+    connections (not the bottleneck) are carrying almost all of the
+    reconstructed identity -- the "cheating" failure mode. images_a,
+    images_b: [B,3,96,96], same batch size."""
+    unet.eval()
+    encoded_a = unet_encode(unet, images_a)
+    encoded_b = unet_encode(unet, images_b)
+    swapped = {
+        "bottleneck": encoded_a["bottleneck"],
+        "skip0": encoded_b["skip0"],
+        "skip1": encoded_b["skip1"],
+        "skip2": encoded_b["skip2"],
+    }
+    return unet_decode(unet, swapped)
+
+
+def print_shape_traces(device: torch.device, latent_dim: int = 128, batch_size: int = 4):
+    """One verbose forward pass per model on a synthetic batch, purely
+    to print the full [B,C,H,W] shape trace -- including, for the
+    U-Net, every skip-connection save and every concatenation -- before
+    training starts. Builds fresh, untrained, throwaway instances of
+    both models just for this printout: the real training models built
+    inside run_comparison are separate instances with their own seeded
+    construction, so this has no effect on the comparison's
+    reproducibility."""
+    sample_batch = torch.rand(batch_size, 3, 96, 96, device=device)  # [B,3,96,96], synthetic, in [0,1]
+
+    print("=== STL10ConvAutoencoder: full shape trace ===")
+    autoencoder_probe = STL10ConvAutoencoder(latent_dim=latent_dim).to(device)
+    _ = autoencoder_probe(sample_batch, verbose=True)
+
+    print("\n=== SmallUNet: full shape trace (skip connections + concatenations) ===")
+    unet_probe = SmallUNet().to(device)
+    _ = unet_probe(sample_batch, verbose=True)
+
+
 @torch.no_grad()
 def evaluate_autoencoder_ssim(model, loader, device, window_size: int = 11):
     """Average SSIM over an entire loader for STL10ConvAutoencoder.
@@ -193,11 +303,29 @@ def visualize_three_way_comparison(
     images: torch.Tensor,
     num_examples: int = 5,
     save_path: str | None = None,
+    include_skip_diagnostics: bool = False,
 ):
     """Row 1 = original, row 2 = autoencoder reconstruction, row 3 =
     U-Net reconstruction, with per-image MSE/PSNR/SSIM (vs. the
     original) under each reconstruction. images: [N,3,96,96] float in
-    [0,1], already on the same device as both models."""
+    [0,1], already on the same device as both models.
+
+    If include_skip_diagnostics=True, two extra verification rows are
+    appended for the U-Net only (the autoencoder has no skip
+    connections to test):
+        row 4: skip-ablation -- U-Net output with all 3 skip tensors
+               zeroed, i.e. reconstructed from the bottleneck alone.
+               A reconstruction that stays sharp here would mean the
+               bottleneck is doing real work; collapsing to something
+               blurry/flat means the skip connections (row 3's normal
+               path) were carrying most of the detail.
+        row 5: skip-swap -- column i's bottleneck decoded with column
+               (i+1)'s skip tensors (cyclic shift). If this row looks
+               like the *next* column's original rather than the
+               current column's, the skip connections are carrying the
+               image's identity almost on their own ("cheating"); see
+               skip_ablation_reconstruction / skip_swap_reconstruction.
+    """
     num_examples = min(num_examples, images.size(0))
 
     autoencoder.eval()
@@ -207,22 +335,34 @@ def visualize_three_way_comparison(
         autoencoder_recon = autoencoder(originals)     # [num_examples,3,96,96]
         unet_recon = unet(originals)                   # [num_examples,3,96,96]
 
-        def per_image_metrics(recon):
-            mse = ((recon - originals) ** 2).mean(dim=(1, 2, 3))  # [num_examples]
-            psnr = psnr_from_mse(mse)                              # [num_examples]
-            ssim_vals = ssim(recon, originals)                     # [num_examples]
+        def per_image_metrics(recon, target):
+            mse = ((recon - target) ** 2).mean(dim=(1, 2, 3))  # [num_examples]
+            psnr = psnr_from_mse(mse)                           # [num_examples]
+            ssim_vals = ssim(recon, target)                     # [num_examples]
             return mse.cpu(), psnr.cpu(), ssim_vals.cpu()
 
-        ae_mse, ae_psnr, ae_ssim = per_image_metrics(autoencoder_recon)
-        unet_mse, unet_psnr, unet_ssim = per_image_metrics(unet_recon)
+        ae_mse, ae_psnr, ae_ssim = per_image_metrics(autoencoder_recon, originals)
+        unet_mse, unet_psnr, unet_ssim = per_image_metrics(unet_recon, originals)
+
+        if include_skip_diagnostics:
+            # row 4: bottleneck-only (all skips zeroed), compared to the original
+            bottleneck_only_recon = skip_ablation_reconstruction(unet, originals)
+            bn_mse, bn_psnr, bn_ssim = per_image_metrics(bottleneck_only_recon, originals)
+
+            # row 5: column i's bottleneck + column (i+1)'s skips (cyclic shift)
+            swap_partner_images = originals.roll(shifts=-1, dims=0)  # [num_examples,3,96,96]
+            swapped_recon = skip_swap_reconstruction(unet, originals, swap_partner_images)
+            # compared to the *swap partner*: a high similarity here is the "cheating" signal
+            sw_mse, sw_psnr, sw_ssim = per_image_metrics(swapped_recon, swap_partner_images)
 
     originals_cpu = originals.cpu()
     autoencoder_recon_cpu = autoencoder_recon.cpu()
     unet_recon_cpu = unet_recon.cpu()
 
-    fig, axes = plt.subplots(3, num_examples, figsize=(2.3 * num_examples, 6.8))
+    n_rows = 5 if include_skip_diagnostics else 3
+    fig, axes = plt.subplots(n_rows, num_examples, figsize=(2.3 * num_examples, 2.3 * n_rows))
     if num_examples == 1:
-        axes = axes.reshape(3, 1)
+        axes = axes.reshape(n_rows, 1)
 
     def to_hwc(img_chw):
         return img_chw.permute(1, 2, 0).numpy()  # [3,96,96] -> [96,96,3]
@@ -246,7 +386,30 @@ def visualize_three_way_comparison(
         )
         axes[2, i].axis("off")
 
-    fig.suptitle(f"original / autoencoder / U-Net reconstruction, {num_examples} examples")
+        if include_skip_diagnostics:
+            bottleneck_only_recon_cpu = bottleneck_only_recon.cpu()
+            swapped_recon_cpu = swapped_recon.cpu()
+            swap_partner_index = (i + 1) % num_examples
+
+            axes[3, i].imshow(to_hwc(bottleneck_only_recon_cpu[i]))
+            axes[3, i].set_title(
+                f"U-Net, skips zeroed\nMSE={bn_mse[i].item():.4f} SSIM={bn_ssim[i].item():.3f}",
+                fontsize=7,
+            )
+            axes[3, i].axis("off")
+
+            axes[4, i].imshow(to_hwc(swapped_recon_cpu[i]))
+            axes[4, i].set_title(
+                f"U-Net, skips from col {swap_partner_index}\n(vs. col {swap_partner_index}) "
+                f"MSE={sw_mse[i].item():.4f} SSIM={sw_ssim[i].item():.3f}",
+                fontsize=7,
+            )
+            axes[4, i].axis("off")
+
+    title = f"original / autoencoder / U-Net reconstruction, {num_examples} examples"
+    if include_skip_diagnostics:
+        title += "\n+ skip-ablation and skip-swap verification rows (see docstring)"
+    fig.suptitle(title)
     fig.tight_layout()
 
     if save_path is not None:
@@ -265,6 +428,9 @@ def run_smoke_test(device: torch.device):
     + loss-comparison plotting code paths run."""
     torch.manual_seed(0)
     from torch.utils.data import DataLoader, TensorDataset
+
+    print("--- shape trace (both models, synthetic batch) ---")
+    print_shape_traces(device, latent_dim=32, batch_size=4)
 
     synthetic_images = torch.rand(8, 3, 96, 96, device=device)  # [8,3,96,96], in [0,1]
     synthetic_labels = torch.zeros(8, dtype=torch.long, device=device)  # unused, placeholder
@@ -311,7 +477,25 @@ def run_smoke_test(device: torch.device):
     print_comparison_summary(summary)
 
     plot_loss_comparison(autoencoder_history, unet_history, save_path="compare_smoke_loss.png")
-    visualize_three_way_comparison(autoencoder, unet, synthetic_images, num_examples=4, save_path="compare_smoke_three_way.png")
+    visualize_three_way_comparison(
+        autoencoder, unet, synthetic_images, num_examples=4, save_path="compare_smoke_three_way.png",
+        include_skip_diagnostics=True,
+    )
+
+    print("\n--- skip-ablation / skip-swap sanity checks ---")
+    bottleneck_only = skip_ablation_reconstruction(unet, synthetic_images)
+    assert bottleneck_only.shape == synthetic_images.shape, (
+        f"bottleneck-only reconstruction shape {tuple(bottleneck_only.shape)} != input shape {tuple(synthetic_images.shape)}"
+    )
+    assert torch.isfinite(bottleneck_only).all(), "bottleneck-only reconstruction has non-finite values"
+
+    swap_partner_images = synthetic_images.roll(shifts=-1, dims=0)
+    swapped = skip_swap_reconstruction(unet, synthetic_images, swap_partner_images)
+    assert swapped.shape == synthetic_images.shape, (
+        f"skip-swap reconstruction shape {tuple(swapped.shape)} != input shape {tuple(synthetic_images.shape)}"
+    )
+    assert torch.isfinite(swapped).all(), "skip-swap reconstruction has non-finite values"
+    print("skip-ablation and skip-swap reconstructions ok (finite, correct shape)")
 
     print("\nsmoke test passed.")
 
@@ -335,6 +519,8 @@ def main():
         run_smoke_test(device)
         return
 
+    print_shape_traces(device, latent_dim=args.latent_dim)
+
     results = run_comparison(
         args.data_root, batch_size=args.batch_size, epochs=args.epochs, lr=args.lr,
         latent_dim=args.latent_dim, device=device, seed=args.seed,
@@ -350,6 +536,7 @@ def main():
     visualize_three_way_comparison(
         results["autoencoder"], results["unet"], sample_images, num_examples=5,
         save_path="stl10_autoencoder_vs_unet_reconstructions.png",
+        include_skip_diagnostics=True,
     )
 
 
