@@ -121,14 +121,25 @@ def unet_decode(unet: SmallUNet, encoded: dict, zero_skips: tuple = ()) -> torch
 
 
 @torch.no_grad()
-def skip_ablation_reconstruction(unet: SmallUNet, images: torch.Tensor) -> torch.Tensor:
-    """Skip-ablation test: decode with all three skip tensors zeroed,
-    i.e. reconstruct from the [B,256,12,12] bottleneck alone. Compares
-    against the normal reconstruction to show how much detail the skip
-    connections were responsible for (see module docstring)."""
+def skip_ablation_reconstruction(
+    unet: SmallUNet, images: torch.Tensor, zero_skips: tuple = ("skip0",),
+) -> torch.Tensor:
+    """Skip-ablation test: decode with the given skip tensors zeroed.
+    Defaults to zeroing only `skip0` -- the finest, 96x96 (highest
+    spatial resolution / "highest order" detail) skip, taken right
+    after a single conv+relu on the raw input, so it is the one most
+    capable of acting as a near-identity shortcut for pixel-level
+    detail. `skip1` (48x48) and `skip2` (24x24) are already more
+    processed/abstracted by the time they reach the decoder, so they
+    are left untouched by default. Zeroing all three at once
+    (zero_skips=("skip0","skip1","skip2")) is still possible by passing
+    it explicitly, but that conflates the separate contributions of
+    each resolution level and produces a maximally-degraded image that
+    doesn't pinpoint *which* skip connection the quality was coming
+    from."""
     unet.eval()
     encoded = unet_encode(unet, images)
-    return unet_decode(unet, encoded, zero_skips=("skip0", "skip1", "skip2"))
+    return unet_decode(unet, encoded, zero_skips=zero_skips)
 
 
 @torch.no_grad()
@@ -294,12 +305,14 @@ def visualize_three_way_comparison(
     If include_skip_diagnostics=True, two extra verification rows are
     appended for the U-Net only (the autoencoder has no skip
     connections to test):
-        row 4: skip-ablation -- U-Net output with all 3 skip tensors
-               zeroed, i.e. reconstructed from the bottleneck alone.
-               A reconstruction that stays sharp here would mean the
-               bottleneck is doing real work; collapsing to something
-               blurry/flat means the skip connections (row 3's normal
-               path) were carrying most of the detail.
+        row 4: skip-ablation -- U-Net output with only `skip0` zeroed
+               (the finest, 96x96 skip, carrying the highest-order
+               spatial detail and the most direct near-identity path
+               from input to output); `skip1`/`skip2` are left intact.
+               A reconstruction that stays close to row 3's quality
+               would mean skip0 wasn't doing much; a sharp drop means
+               skip0 (not the bottleneck) was responsible for most of
+               row 3's fine detail.
         row 5: skip-swap -- column i's bottleneck decoded with column
                (i+1)'s skip tensors (cyclic shift). If this row looks
                like the *next* column's original rather than the
@@ -326,9 +339,9 @@ def visualize_three_way_comparison(
         unet_mse, unet_psnr, unet_ssim = per_image_metrics(unet_recon, originals)
 
         if include_skip_diagnostics:
-            # row 4: bottleneck-only (all skips zeroed), compared to the original
-            bottleneck_only_recon = skip_ablation_reconstruction(unet, originals)
-            bn_mse, bn_psnr, bn_ssim = per_image_metrics(bottleneck_only_recon, originals)
+            # row 4: skip0 (finest, highest-order-detail skip) zeroed; skip1/skip2 untouched
+            skip0_ablated_recon = skip_ablation_reconstruction(unet, originals)
+            bn_mse, bn_psnr, bn_ssim = per_image_metrics(skip0_ablated_recon, originals)
 
             # row 5: column i's bottleneck + column (i+1)'s skips (cyclic shift)
             swap_partner_images = originals.roll(shifts=-1, dims=0)  # [num_examples,3,96,96]
@@ -368,13 +381,13 @@ def visualize_three_way_comparison(
         axes[2, i].axis("off")
 
         if include_skip_diagnostics:
-            bottleneck_only_recon_cpu = bottleneck_only_recon.cpu()
+            skip0_ablated_recon_cpu = skip0_ablated_recon.cpu()
             swapped_recon_cpu = swapped_recon.cpu()
             swap_partner_index = (i + 1) % num_examples
 
-            axes[3, i].imshow(to_hwc(bottleneck_only_recon_cpu[i]))
+            axes[3, i].imshow(to_hwc(skip0_ablated_recon_cpu[i]))
             axes[3, i].set_title(
-                f"U-Net, skips zeroed\nMSE={bn_mse[i].item():.4f} SSIM={bn_ssim[i].item():.3f}",
+                f"U-Net, skip0 zeroed\nMSE={bn_mse[i].item():.4f} SSIM={bn_ssim[i].item():.3f}",
                 fontsize=7,
             )
             axes[3, i].axis("off")
@@ -464,11 +477,11 @@ def run_smoke_test(device: torch.device):
     )
 
     print("\n--- skip-ablation / skip-swap sanity checks ---")
-    bottleneck_only = skip_ablation_reconstruction(unet, synthetic_images)
-    assert bottleneck_only.shape == synthetic_images.shape, (
-        f"bottleneck-only reconstruction shape {tuple(bottleneck_only.shape)} != input shape {tuple(synthetic_images.shape)}"
+    skip0_ablated = skip_ablation_reconstruction(unet, synthetic_images)
+    assert skip0_ablated.shape == synthetic_images.shape, (
+        f"skip0-ablated reconstruction shape {tuple(skip0_ablated.shape)} != input shape {tuple(synthetic_images.shape)}"
     )
-    assert torch.isfinite(bottleneck_only).all(), "bottleneck-only reconstruction has non-finite values"
+    assert torch.isfinite(skip0_ablated).all(), "skip0-ablated reconstruction has non-finite values"
 
     swap_partner_images = synthetic_images.roll(shifts=-1, dims=0)
     swapped = skip_swap_reconstruction(unet, synthetic_images, swap_partner_images)
