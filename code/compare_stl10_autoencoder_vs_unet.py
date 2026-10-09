@@ -57,6 +57,7 @@ from stl10_unet import (
     evaluate as evaluate_unet,
     evaluate_ssim as evaluate_unet_ssim,
 )
+from stl10_shape_trace import print_shape_traces
 
 
 def unet_encode(unet: SmallUNet, x: torch.Tensor) -> dict:
@@ -147,26 +148,6 @@ def skip_swap_reconstruction(unet: SmallUNet, images_a: torch.Tensor, images_b: 
         "skip2": encoded_b["skip2"],
     }
     return unet_decode(unet, swapped)
-
-
-def print_shape_traces(device: torch.device, latent_dim: int = 128, batch_size: int = 4):
-    """One verbose forward pass per model on a synthetic batch, purely
-    to print the full [B,C,H,W] shape trace -- including, for the
-    U-Net, every skip-connection save and every concatenation -- before
-    training starts. Builds fresh, untrained, throwaway instances of
-    both models just for this printout: the real training models built
-    inside run_comparison are separate instances with their own seeded
-    construction, so this has no effect on the comparison's
-    reproducibility."""
-    sample_batch = torch.rand(batch_size, 3, 96, 96, device=device)  # [B,3,96,96], synthetic, in [0,1]
-
-    print("=== STL10ConvAutoencoder: full shape trace ===")
-    autoencoder_probe = STL10ConvAutoencoder(latent_dim=latent_dim).to(device)
-    _ = autoencoder_probe(sample_batch, verbose=True)
-
-    print("\n=== SmallUNet: full shape trace (skip connections + concatenations) ===")
-    unet_probe = SmallUNet().to(device)
-    _ = unet_probe(sample_batch, verbose=True)
 
 
 @torch.no_grad()
