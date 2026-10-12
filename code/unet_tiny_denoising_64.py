@@ -46,12 +46,40 @@ unlike the original paper's valid-padding convs, whose feature maps
 shrink and therefore need center-cropping before concatenation.
 
 Task used to exercise the architecture: image denoising. A clean image
-x is corrupted with additive Gaussian noise to make x_noisy, and the
-U-Net is trained to map x_noisy -> x_hat ~= x (L = ||x - U-Net(x_noisy)||^2).
-This is the same input/output-image-shape setup a DDPM noise-predictor
-U-Net uses, so it is a natural next step toward that part of the thesis
--- it is a denoising autoencoder, not a diffusion model (no timestep
+x is corrupted with additive Gaussian noise to make x_noisy = x + sigma*eps,
+eps ~ N(0,I), and the U-Net is trained to undo the corruption. This is
+the same input/output-image-shape setup a DDPM noise-predictor U-Net
+uses, so it is a natural next step toward that part of the thesis --
+it is a denoising autoencoder, not a diffusion model (no timestep
 conditioning, no noise schedule).
+
+TinyUNet64 supports two training objectives, selected via the
+`prediction_mode` constructor argument, both trained with the same
+pixel-wise MSE loss and compared directly in
+code/compare_denoising_objectives.py:
+
+    "x0"    -- the network directly predicts the clean image:
+               x_hat = UNet(x_noisy), final activation = Sigmoid
+               (output squashed to [0,1], matching the image range).
+               L = ||x - x_hat||^2.
+    "noise" -- the network predicts the corruption itself:
+               eps_hat = UNet(x_noisy), final activation = identity
+               (no squashing -- eps is unbounded and zero-mean, so a
+               Sigmoid would wrongly clip/bias it).
+               L = ||eps - eps_hat||^2, where eps = x_noisy - x
+               (the actual, already-clamped corruption applied -- see
+               `make_noisy_and_target_noise`).
+               The clean-image estimate is then recovered afterward via
+               x_hat = clamp(x_noisy - eps_hat, 0, 1)
+               (see `denoise_to_clean_image`); if eps_hat == eps exactly,
+               this recovers x exactly, by construction of eps.
+
+This mirrors the two equivalent parameterizations of a DDPM
+noise-predictor (predict x0 vs. predict eps; see Ho et al., 2020,
+Sec. 3.2): the architecture and the ground-truth information available
+per sample are identical between the two modes, only the *target the
+loss is computed against* differs, so any gap in resulting denoising
+quality isolates the effect of the training objective itself.
 
 Local usage (lightweight smoke test only, no dataset download):
     python code/unet_tiny_denoising_64.py --smoke-test
@@ -75,8 +103,19 @@ class TinyUNet64(nn.Module):
     named explicitly. See module docstring for the full shape trace.
     """
 
-    def __init__(self, in_channels: int = 3, out_channels: int = 3, base_channels: int = 32):
+    def __init__(
+        self,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        base_channels: int = 32,
+        prediction_mode: str = "x0",
+    ):
         super().__init__()
+        assert prediction_mode in ("x0", "noise"), (
+            f"prediction_mode must be 'x0' or 'noise', got {prediction_mode!r}"
+        )
+        self.prediction_mode = prediction_mode
+
         c1, c2, c3, c4 = base_channels, base_channels * 2, base_channels * 4, base_channels * 8
 
         # --- encoder: 64->32->16->8, channels in->c1->c2->c3 ---
@@ -111,7 +150,10 @@ class TinyUNet64(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor, verbose: bool = False) -> torch.Tensor:
-        """x: [B, in_channels, 64, 64] -> out: [B, out_channels, 64, 64] in [0,1]."""
+        """x: [B, in_channels, 64, 64] (the noisy image, x_noisy) ->
+        out: [B, out_channels, 64, 64]. Meaning of `out` depends on
+        self.prediction_mode: x_hat in [0,1] for "x0", or eps_hat
+        (unbounded) for "noise"."""
 
         def log(label, tensor):
             if verbose:
@@ -168,8 +210,13 @@ class TinyUNet64(nn.Module):
 
         h = self.out_conv(h)
         log("after out_conv", h)
-        out = self.sigmoid(h)
-        log("after sigmoid (final output)", out)
+
+        if self.prediction_mode == "x0":
+            out = self.sigmoid(h)
+            log("after sigmoid (final output = x_hat, in [0,1])", out)
+        else:  # "noise": eps is unbounded and zero-mean, so no squashing activation
+            out = h
+            log("final output = eps_hat (unbounded, no activation)", out)
 
         return out
 
@@ -190,6 +237,35 @@ def add_gaussian_noise(images: torch.Tensor, noise_std: float) -> torch.Tensor:
     back to [0,1] so the U-Net always sees a valid image range."""
     noisy = images + noise_std * torch.randn_like(images)
     return noisy.clamp(0.0, 1.0)
+
+
+def make_noisy_and_target_noise(images: torch.Tensor, noise_std: float):
+    """images: [B,C,H,W] in [0,1] -> (noisy, noise), both [B,C,H,W].
+
+    noise := noisy - images, i.e. the *actual* corruption applied to
+    this particular image, taken *after* clamping noisy back to [0,1].
+    Defining the target this way (rather than the pre-clamp
+    noise_std*eps draw) keeps x = noisy - noise exactly true by
+    construction even for pixels where the Gaussian draw saturated the
+    [0,1] range, which is what the "noise" prediction_mode's loss
+    target and `denoise_to_clean_image` both rely on."""
+    noisy = add_gaussian_noise(images, noise_std)
+    noise = noisy - images
+    return noisy, noise
+
+
+def denoise_to_clean_image(model: "TinyUNet64", noisy_images: torch.Tensor) -> torch.Tensor:
+    """Runs the model and converts its raw output into a clean-image
+    estimate x_hat in [0,1], regardless of model.prediction_mode:
+        "x0"    -> model already outputs x_hat directly.
+        "noise" -> model outputs eps_hat; x_hat = clamp(noisy - eps_hat, 0, 1),
+                   the same algebraic inverse used to define the
+                   "noise" target in `make_noisy_and_target_noise`.
+    noisy_images: [B,C,H,W] -> x_hat: [B,C,H,W] in [0,1]."""
+    prediction = model(noisy_images)
+    if model.prediction_mode == "x0":
+        return prediction
+    return (noisy_images - prediction).clamp(0.0, 1.0)
 
 
 def get_cifar10_denoising_dataloaders(data_root: str, batch_size: int, image_size: int = 64):
@@ -224,8 +300,10 @@ def visualize_denoising(
     save_path: str | None = None,
 ):
     """Qualitative check: row 1 = clean (ground truth), row 2 = noisy
-    input, row 3 = U-Net output, with per-image MSE/PSNR (output vs.
-    clean) in each row-3 title.
+    input, row 3 = U-Net's clean-image estimate x_hat (recovered via
+    `denoise_to_clean_image`, which handles both prediction_mode
+    values), with per-image MSE/PSNR (output vs. clean) in each row-3
+    title.
 
     clean_images: [N,C,H,W] float in [0,1], already on model's device.
     """
@@ -235,7 +313,7 @@ def visualize_denoising(
     with torch.no_grad():
         clean = clean_images[:num_examples]                 # [num_examples,C,H,W]
         noisy = add_gaussian_noise(clean, noise_std)         # [num_examples,C,H,W]
-        denoised = model(noisy)                               # [num_examples,C,H,W]
+        denoised = denoise_to_clean_image(model, noisy)       # [num_examples,C,H,W], in [0,1]
         per_image_mse = ((denoised - clean) ** 2).mean(dim=(1, 2, 3))  # [num_examples]
         per_image_psnr = psnr_from_mse(per_image_mse)          # [num_examples], dB
 
@@ -249,7 +327,7 @@ def visualize_denoising(
     if num_examples == 1:
         axes = axes.reshape(3, 1)
 
-    row_titles = ["clean (target)", "noisy (input)", "U-Net output"]
+    row_titles = ["clean (target)", "noisy (input)", "U-Net x_hat"]
     for i in range(num_examples):
         axes[0, i].imshow(to_hwc(clean_cpu[i]))
         axes[0, i].set_title(row_titles[0] if i == 0 else "", fontsize=9)
@@ -263,7 +341,10 @@ def visualize_denoising(
         axes[2, i].set_title(f"MSE={mse_cpu[i].item():.4f}\nPSNR={psnr_cpu[i].item():.1f}dB", fontsize=8)
         axes[2, i].axis("off")
 
-    fig.suptitle(f"clean / noisy (std={noise_std}) / U-Net-denoised, {num_examples} examples")
+    fig.suptitle(
+        f"clean / noisy (std={noise_std}) / U-Net-denoised "
+        f"(prediction_mode={model.prediction_mode!r}), {num_examples} examples"
+    )
     fig.tight_layout()
 
     if save_path is not None:
@@ -275,16 +356,23 @@ def visualize_denoising(
 
 
 def train_one_epoch(model, loader, loss_fn, optimizer, device, noise_std):
+    """One training epoch. The loss target depends on model.prediction_mode:
+    "x0" trains the raw model output against the clean image directly;
+    "noise" trains it against the actual added noise (see
+    `make_noisy_and_target_noise`). Both cases use the same `loss_fn`
+    (MSE) and the same forward/backward/step structure -- only the
+    *target tensor* differs, isolating the effect of the objective."""
     model.train()
     total_loss, total_samples = 0.0, 0
 
     for clean_images, _labels in loader:
         clean_images = clean_images.to(device)              # [B,C,H,W]; label unused
-        noisy_images = add_gaussian_noise(clean_images, noise_std)
+        noisy_images, noise = make_noisy_and_target_noise(clean_images, noise_std)
+        target = clean_images if model.prediction_mode == "x0" else noise
 
         optimizer.zero_grad()
-        denoised = model(noisy_images)                       # [B,C,H,W]
-        loss = loss_fn(denoised, clean_images)                # scalar MSE vs. clean target
+        prediction = model(noisy_images)                     # [B,C,H,W]: x_hat or eps_hat
+        loss = loss_fn(prediction, target)                   # scalar MSE vs. the mode's own target
         loss.backward()
         optimizer.step()
 
@@ -296,14 +384,19 @@ def train_one_epoch(model, loader, loss_fn, optimizer, device, noise_std):
 
 @torch.no_grad()
 def evaluate(model, loader, loss_fn, device, noise_std):
+    """Test-set loss in the model's own native units (x0: pixel MSE;
+    noise: noise MSE) -- NOT directly comparable between the two
+    prediction_modes. Use `evaluate_denoising_mse` for the common,
+    cross-mode-comparable metric (denoising MSE of x_hat vs. clean)."""
     model.eval()
     total_loss, total_samples = 0.0, 0
 
     for clean_images, _labels in loader:
         clean_images = clean_images.to(device)
-        noisy_images = add_gaussian_noise(clean_images, noise_std)
-        denoised = model(noisy_images)
-        loss = loss_fn(denoised, clean_images)
+        noisy_images, noise = make_noisy_and_target_noise(clean_images, noise_std)
+        target = clean_images if model.prediction_mode == "x0" else noise
+        prediction = model(noisy_images)
+        loss = loss_fn(prediction, target)
 
         total_loss += loss.item() * clean_images.size(0)
         total_samples += clean_images.size(0)
@@ -311,39 +404,81 @@ def evaluate(model, loader, loss_fn, device, noise_std):
     return total_loss / total_samples
 
 
+@torch.no_grad()
+def evaluate_denoising_mse(model, loader, device, noise_std):
+    """Test-set MSE of the recovered clean-image estimate x_hat vs. the
+    clean image, via `denoise_to_clean_image` -- identical units
+    (pixel-space MSE, inputs in [0,1]) regardless of model.prediction_mode,
+    so this is the metric to use when comparing "x0" vs. "noise" models
+    (unlike `evaluate`, whose loss is in each mode's own native units)."""
+    model.eval()
+    total_mse, total_samples = 0.0, 0
+
+    for clean_images, _labels in loader:
+        clean_images = clean_images.to(device)
+        noisy_images = add_gaussian_noise(clean_images, noise_std)
+        x_hat = denoise_to_clean_image(model, noisy_images)
+        batch_mse = ((x_hat - clean_images) ** 2).mean(dim=(1, 2, 3))  # [B]
+
+        total_mse += batch_mse.sum().item()
+        total_samples += clean_images.size(0)
+
+    return total_mse / total_samples
+
+
 def run_smoke_test(device: torch.device):
     """Lightweight local verification: synthetic tensors only, no
-    dataset download, no real training. Confirms construction, the
-    full forward shape trace (including every skip-connection save and
-    every concatenation), parameter count, one backward pass, one
-    optimizer step, and the denoising-visualization code path.
+    dataset download, no real training. For each prediction_mode
+    ("x0", "noise") confirms construction, one backward pass + one
+    optimizer step, and (for "x0") the full forward shape trace +
+    the denoising-visualization code path. Also checks that
+    `denoise_to_clean_image` recovers the clean image exactly when the
+    model's raw output is forced to equal the true target (sanity
+    check on the x0/noise algebra itself, independent of training).
     """
     torch.manual_seed(0)
 
-    model = TinyUNet64(in_channels=3, out_channels=3, base_channels=32).to(device)
-    n_params = count_trainable_parameters(model)
-    print(f"trainable parameters: {n_params:,}")
-
     dummy_clean = torch.rand(4, 3, 64, 64, device=device)  # [B,3,64,64], in [0,1]
-    dummy_noisy = add_gaussian_noise(dummy_clean, noise_std=0.3)
-
-    print("\n--- forward shape trace (every skip connection + concatenation) ---")
-    denoised = model(dummy_noisy, verbose=True)
-    assert denoised.shape == dummy_clean.shape, (
-        f"output shape {tuple(denoised.shape)} != input shape {tuple(dummy_clean.shape)}"
-    )
-
     loss_fn = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    loss = loss_fn(denoised, dummy_clean)
-    assert torch.isfinite(loss), "loss is not finite"
-    loss.backward()
-    optimizer.step()
-    print(f"\ndummy denoising MSE: {loss.item():.4f} (finite, backward + optimizer step ok)")
+    for prediction_mode in ("x0", "noise"):
+        print(f"\n=== prediction_mode={prediction_mode!r} ===")
+        model = TinyUNet64(in_channels=3, out_channels=3, base_channels=32, prediction_mode=prediction_mode).to(device)
+        n_params = count_trainable_parameters(model)
+        print(f"trainable parameters: {n_params:,}")
 
+        noisy_images, noise = make_noisy_and_target_noise(dummy_clean, noise_std=0.3)
+        target = dummy_clean if prediction_mode == "x0" else noise
+
+        if prediction_mode == "x0":
+            print("\n--- forward shape trace (every skip connection + concatenation) ---")
+            prediction = model(noisy_images, verbose=True)
+        else:
+            prediction = model(noisy_images)
+        assert prediction.shape == dummy_clean.shape, (
+            f"output shape {tuple(prediction.shape)} != input shape {tuple(dummy_clean.shape)}"
+        )
+
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        loss = loss_fn(prediction, target)
+        assert torch.isfinite(loss), "loss is not finite"
+        loss.backward()
+        optimizer.step()
+        print(f"dummy {prediction_mode} MSE: {loss.item():.4f} (finite, backward + optimizer step ok)")
+
+    print("\n--- x0/noise algebra sanity check (denoise_to_clean_image) ---")
+    # If the "noise" model's raw output exactly equals the true noise,
+    # x_hat = noisy - eps_hat must recover the clean image exactly.
+    x_hat_from_true_noise = (noisy_images - noise).clamp(0.0, 1.0)
+    assert torch.allclose(x_hat_from_true_noise, dummy_clean, atol=1e-5), (
+        "noisy - true_noise should recover the clean image exactly"
+    )
+    print("noisy_images - true_noise == clean image (exact, as expected)")
+
+    print("\n--- denoising-visualization code path (prediction_mode='x0' model) ---")
+    x0_model = TinyUNet64(in_channels=3, out_channels=3, base_channels=32, prediction_mode="x0").to(device)
     scratch_png = "unet_tiny_denoising_smoke.png"
-    visualize_denoising(model, dummy_clean, noise_std=0.3, num_examples=4, save_path=scratch_png)
+    visualize_denoising(x0_model, dummy_clean, noise_std=0.3, num_examples=4, save_path=scratch_png)
 
     print("\nsmoke test passed.")
 
@@ -359,6 +494,9 @@ def main():
     parser.add_argument("--noise-std", type=float, default=0.3,
                          help="std of the additive Gaussian noise used to create the denoising task")
     parser.add_argument("--base-channels", type=int, default=32)
+    parser.add_argument("--prediction-mode", type=str, default="x0", choices=["x0", "noise"],
+                         help="training objective: predict the clean image directly ('x0') "
+                              "or predict the added noise ('noise'); see module docstring")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -371,8 +509,11 @@ def main():
 
     torch.manual_seed(args.seed)
 
-    model = TinyUNet64(in_channels=3, out_channels=3, base_channels=args.base_channels).to(device)
+    model = TinyUNet64(
+        in_channels=3, out_channels=3, base_channels=args.base_channels, prediction_mode=args.prediction_mode,
+    ).to(device)
     print(f"trainable parameters: {count_trainable_parameters(model):,}")
+    print(f"prediction_mode = {args.prediction_mode!r}")
 
     train_loader, test_loader = get_cifar10_denoising_dataloaders(args.data_root, args.batch_size, image_size=64)
 
@@ -382,13 +523,19 @@ def main():
     for epoch in range(args.epochs):
         train_loss = train_one_epoch(model, train_loader, loss_fn, optimizer, device, args.noise_std)
         test_loss = evaluate(model, test_loader, loss_fn, device, args.noise_std)
-        print(f"epoch {epoch + 1:3d}/{args.epochs}  train_mse={train_loss:.4f}  test_mse={test_loss:.4f}")
+        test_denoising_mse = evaluate_denoising_mse(model, test_loader, device, args.noise_std)
+        print(
+            f"epoch {epoch + 1:3d}/{args.epochs}  "
+            f"train_loss({args.prediction_mode})={train_loss:.4f}  "
+            f"test_loss({args.prediction_mode})={test_loss:.4f}  "
+            f"test_denoising_mse(x_hat vs clean)={test_denoising_mse:.4f}"
+        )
 
     sample_images, _sample_labels = next(iter(test_loader))
     sample_images = sample_images.to(device)
     visualize_denoising(
         model, sample_images, args.noise_std, num_examples=5,
-        save_path="unet_tiny_denoising_reconstructions.png",
+        save_path=f"unet_tiny_denoising_reconstructions_{args.prediction_mode}.png",
     )
 
 
