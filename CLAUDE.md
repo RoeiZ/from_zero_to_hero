@@ -217,6 +217,25 @@ and other state required for faithful resume.
 Do not keep the only important checkpoint in ephemeral Colab storage.
 Persistent paths such as Google Drive should be configurable.
 
+## New-Notebook Workflow: Train/Evaluate Split
+
+Whenever a new task requires creating a NEW Colab notebook (not
+editing a notebook that already exists), ask the user whether to:
+
+1. keep training and evaluation/testing in a single notebook, or
+2. split it into two notebooks -- a `*_train.ipynb` that trains and
+   saves a checkpoint (model + optimizer + epoch + config) to Drive,
+   and a `*_evaluate.ipynb` that loads that checkpoint and runs
+   tests/sweeps/visualizations without retraining.
+
+The point of the split is to make it cheap to add new tests/diagnostics
+later: once a model is trained, `*_evaluate.ipynb` can be edited and
+rerun in seconds against the saved checkpoint, no GPU training step
+required.
+
+This policy applies to NEW notebook work only -- do not retrofit this
+split onto already-existing notebooks/scripts unless explicitly asked.
+
 ## Experiment Logging
 
 For thesis experiments record the relevant: experiment ID, Git commit,
